@@ -1,5 +1,7 @@
 import io
 import time
+import json
+import asyncio
 import requests
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import RedirectResponse, HTMLResponse, StreamingResponse
@@ -12,16 +14,16 @@ app = FastAPI()
 
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 REDIRECT_URI = "https://ys-duda.onrender.com/oauth2callback"
-TOKEN = {}
+TOKEN = {}  # In-memory storage (for single-user; use file/DB for production)
 
 def get_home_html(show_form: bool = False):
-    login_btn = '<a href="/login"><button>Login with Google (One Time)</button></a>'
+    login_btn = '<a href="/login"><button class="btn btn-primary">Login with Google (One Time)</button></a>'
     form = """
     <h2>Upload to YouTube (Private)</h2>
-    <form id="upload-form" action="/upload" method="post" hx-post="/upload" hx-target="#result" hx-swap="innerHTML">
+    <form id="upload-form" method="post" action="/upload">
         <input type="text" name="seedr_url" placeholder="Paste Seedr Direct Link" size="80" required><br><br>
         <input type="text" name="title" placeholder="Video Title (required)" required><br><br>
-        <button type="submit">Upload</button>
+        <button type="submit" class="btn btn-success">Upload</button>
     </form>
     <div id="progress-container" style="display:none; margin-top:20px;">
         <h3>Progress</h3>
@@ -33,6 +35,7 @@ def get_home_html(show_form: bool = False):
         </div>
         <div>ETA: <span id="eta">-</span> | Size: <span id="size">0 MB</span></div>
     </div>
+    <div id="result" class="mt-4"></div>
     """
     return f"""
     <!DOCTYPE html>
@@ -67,7 +70,6 @@ def get_home_html(show_form: bool = False):
     <body class="container mt-5">
         <h2>YouTube Private Uploader</h2>
         {login_btn if not show_form else form}
-        <div id="result" class="mt-4"></div>
     </body>
     </html>
     """
@@ -84,7 +86,11 @@ def login():
         scopes=SCOPES,
         redirect_uri=REDIRECT_URI
     )
-    auth_url, _ = flow.authorization_url(access_type="offline", include_granted_scopes="true")
+    auth_url, _ = flow.authorization_url(
+        access_type="offline",
+        include_granted_scopes="true",
+        prompt="consent"  # Forces consent screen → always get refresh_token
+    )
     return RedirectResponse(auth_url)
 
 @app.get("/oauth2callback")
@@ -96,37 +102,40 @@ def oauth2callback(code: str):
     )
     flow.fetch_token(code=code)
     creds = flow.credentials
-    TOKEN["creds"] = creds.to_json()  # Better: store as JSON string
+    TOKEN["creds"] = creds.to_json()  # Standard JSON format compatible with from_authorized_user_info
     return RedirectResponse("/")
 
-# Global progress state (simple in-memory for single-user app)
+# Progress state (in-memory)
 progress_state = {
     "phase": "Idle",
-    "dl_bytes": 0,
-    "ul_bytes": 0,
-    "total_size": 0,
-    "start_time": 0,
-    "dl_start": 0,
-    "ul_start": 0,
+    "dl_bytes": 0, "ul_bytes": 0, "total_size": 0,
+    "dl_start": 0, "ul_start": 0,
 }
 
 async def progress_generator(request: Request):
     while True:
         if await request.is_disconnected():
             break
+        total = progress_state["total_size"] or 1
+        dl_percent = round(progress_state["dl_bytes"] / total * 100, 1)
+        ul_percent = round(progress_state["ul_bytes"] / total * 100, 1)
+        overall = round((progress_state["dl_bytes"] + progress_state["ul_bytes"]) / (total * 2) * 100, 1)
+        dl_speed = f"{(progress_state['dl_bytes'] / (time.time() - progress_state['dl_start']) / 1e6):.2f}" if progress_state["dl_start"] else "0.00"
+        ul_speed = f"{(progress_state['ul_bytes'] / (time.time() - progress_state['ul_start']) / 1e6):.2f}" if progress_state["ul_start"] else "0.00"
+        eta = "Calculating..." if total == 0 else f"{((total * 2 - progress_state['dl_bytes'] - progress_state['ul_bytes']) / 1e6 / max((dl_speed + ul_speed), 1)):.1f} min"
         data = {
             "phase": progress_state["phase"],
-            "dl_percent": round((progress_state["dl_bytes"] / progress_state["total_size"] * 100) if progress_state["total_size"] > 0 else 0, 1),
-            "ul_percent": round((progress_state["ul_bytes"] / progress_state["total_size"] * 100) if progress_state["total_size"] > 0 else 0, 1),
-            "overall": round(((progress_state["dl_bytes"] + progress_state["ul_bytes"]) / (progress_state["total_size"] * 2) * 100) if progress_state["total_size"] > 0 else 0, 1),
-            "dl_speed": f"{(progress_state['dl_bytes'] / (time.time() - progress_state['dl_start']) / 1e6):.2f}" if progress_state["dl_start"] else "0",
-            "ul_speed": f"{(progress_state['ul_bytes'] / (time.time() - progress_state['ul_start']) / 1e6):.2f}" if progress_state["ul_start"] else "0",
-            "eta": "Calculating..." if progress_state["total_size"] == 0 else f"{(progress_state['total_size'] * 2 - progress_state['dl_bytes'] - progress_state['ul_bytes']) / 1e6 / 10:.1f} min (est)",  # rough ETA
-            "size": f"{progress_state['total_size'] / 1e6:.1f} MB",
+            "dl_percent": dl_percent,
+            "ul_percent": ul_percent,
+            "overall": overall,
+            "dl_speed": dl_speed,
+            "ul_speed": ul_speed,
+            "eta": eta,
+            "size": f"{total / 1e6:.1f} MB",
         }
-        yield f"data: {__import__('json').dumps(data)}\n\n"
-        await __import__('asyncio').sleep(1)
-        if progress_state["phase"] == "Done" or progress_state["phase"].startswith("Error"):
+        yield f"data: {json.dumps(data)}\n\n"
+        await asyncio.sleep(1)
+        if progress_state["phase"] in ["Done", "Error"]:
             yield "data: DONE\n\n"
             break
 
@@ -139,22 +148,31 @@ async def upload(seedr_url: str = Form(...), title: str = Form(...)):
     if "creds" not in TOKEN:
         return RedirectResponse("/login")
 
-    # Reset progress
     progress_state.update({
         "phase": "Downloading from Seedr...",
         "dl_bytes": 0, "ul_bytes": 0, "total_size": 0,
-        "start_time": time.time(), "dl_start": time.time(), "ul_start": 0,
+        "dl_start": time.time(), "ul_start": 0,
     })
 
     try:
-        creds = Credentials.from_authorized_user_info(__import__('json').loads(TOKEN["creds"]))
+        info = json.loads(TOKEN["creds"])
+        if "refresh_token" not in info:
+            return HTMLResponse("""
+            <div class="alert alert-danger">
+                <h3>Missing Refresh Token</h3>
+                <p>Your stored credentials are missing the refresh_token (common after multiple logins without forced consent).</p>
+                <p><a href="/logout">Log out and log in again</a> to fix this.</p>
+            </div>
+            """)
+
+        creds = Credentials.from_authorized_user_info(info, SCOPES)
         youtube = build("youtube", "v3", credentials=creds)
 
         # Download with progress
         r = requests.get(seedr_url, stream=True, timeout=60)
         r.raise_for_status()
         content_length = int(r.headers.get('content-length', 0))
-        progress_state["total_size"] = content_length
+        progress_state["total_size"] = content_length or 1  # avoid divide by zero
 
         stream = io.BytesIO()
         for chunk in r.iter_content(chunk_size=1024*1024):
@@ -167,7 +185,6 @@ async def upload(seedr_url: str = Form(...), title: str = Form(...)):
         progress_state["ul_start"] = time.time()
 
         media = MediaIoBaseUpload(stream, mimetype="video/mp4", resumable=True)
-
         request = youtube.videos().insert(
             part="snippet,status",
             body={
@@ -191,11 +208,14 @@ async def upload(seedr_url: str = Form(...), title: str = Form(...)):
             <a href="{link}" target="_blank">{link}</a><br><br>
             <a href="/">Upload another</a>
         </div>
-        <script>document.getElementById('progress-container').style.display = 'none';</script>
+        <script>
+            document.getElementById('progress-container').style.display = 'none';
+            startProgress();  // Keep connection open until DONE
+        </script>
         """
 
     except Exception as e:
-        progress_state["phase"] = f"Error: {str(e)}"
+        progress_state["phase"] = "Error"
         return f"""
         <div class="alert alert-danger">
             <h3>Error</h3>
@@ -203,3 +223,9 @@ async def upload(seedr_url: str = Form(...), title: str = Form(...)):
             <a href="/">Go back</a>
         </div>
         """
+
+# Optional: Add a logout to clear creds and force re-login
+@app.get("/logout")
+def logout():
+    TOKEN.clear()
+    return RedirectResponse("/")
