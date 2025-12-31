@@ -62,8 +62,14 @@ def oauth2callback(code: str):
     }
     return RedirectResponse("/")
 
+from fastapi.responses import RedirectResponse
+
 @app.post("/upload", response_class=HTMLResponse)
 def upload(seedr_url: str = Form(...), title: str = Form("Private Video")):
+
+    if "creds" not in TOKEN:
+        return RedirectResponse("/login", status_code=302)
+
     creds = Credentials(**TOKEN["creds"])
     youtube = build("youtube", "v3", credentials=creds)
 
@@ -92,7 +98,6 @@ def upload(seedr_url: str = Form(...), title: str = Form("Private Video")):
 
     return f"""
     <h3>Upload Successful</h3>
-    <a href="{link}" target="_blank">{link}</a>
-    <br><br>
+    <a href="{link}" target="_blank">{link}</a><br><br>
     <a href="/">Upload another</a>
     """
