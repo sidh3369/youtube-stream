@@ -6,3 +6,4 @@ google-auth
 google-auth-oauthlib
 jinja2
 python-multipart
+seedrcc
