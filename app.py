@@ -1,4 +1,4 @@
-import os
+import io
 import time
 import json
 import asyncio
@@ -7,7 +7,7 @@ from fastapi import FastAPI, Request, Form
 from fastapi.responses import RedirectResponse, HTMLResponse, StreamingResponse
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
-from googleapiclient.http import HttpRequest  # For manual requests
+from googleapiclient.http import MediaIoBaseUpload
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request as AuthRequest
 
@@ -17,38 +17,75 @@ SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 REDIRECT_URI = "https://ys-duda.onrender.com/oauth2callback"
 TOKEN = {}
 
-# ------------------- HTML UI (Simplified for Streaming) -------------------
+CHUNK_SIZE = 1024 * 1024 * 5  # 5MB chunks - good balance for speed/memory
+
+# ------------------- Custom Streaming Class -------------------
+class SeedrStream(io.IOBase):
+    def __init__(self, url: str):
+        self.url = url
+        self.response = requests.get(url, stream=True, timeout=120)
+        self.response.raise_for_status()
+        self.iterator = self.response.iter_content(chunk_size=CHUNK_SIZE)
+        self.buffer = b""
+        self.total_size = int(self.response.headers.get("content-length", 0))
+        self.transferred = 0
+
+    def readable(self):
+        return True
+
+    def read(self, size=-1):
+        if size == -1:
+            size = CHUNK_SIZE
+        while len(self.buffer) < size:
+            try:
+                chunk = next(self.iterator)
+                if not chunk:
+                    break
+                self.buffer += chunk
+                self.transferred += len(chunk)
+                progress_state["transferred"] = self.transferred
+            except StopIteration:
+                break
+        data, self.buffer = self.buffer[:size], self.buffer[size:]
+        return data
+
+    def size(self):
+        return self.total_size
+
+    def close(self):
+        self.response.close()
+
+# ------------------- HTML UI -------------------
 def get_home_html(show_form: bool = False):
     login_btn = '<a href="/login"><button class="btn btn-primary btn-lg">Login with Google</button></a>'
     form = """
     <div class="card p-4 mt-4">
-        <h3>Direct Stream Upload from Seedr to YouTube (Private)</h3>
-        <p><small>No full download on server - streams directly!</small></p>
+        <h3>Direct Stream from Seedr → YouTube (Private)</h3>
+        <p><small>True streaming: no full download on server!</small></p>
         <form id="upload-form" method="post" action="/upload" onsubmit="startProgress()">
             <div class="mb-3">
-                <input type="text" name="seedr_url" class="form-control" placeholder="Seedr Direct Download Link (must be valid & accessible)" required>
+                <input type="text" name="seedr_url" class="form-control" placeholder="Seedr Direct Link (e.g. https://rd22.seedr.cc/...)" required>
             </div>
             <div class="mb-3">
                 <input type="text" name="title" class="form-control" placeholder="Video Title" required>
             </div>
-            <button type="submit" class="btn btn-success btn-lg">Stream & Upload</button>
+            <button type="submit" class="btn btn-success btn-lg">Start Streaming Upload</button>
         </form>
 
         <div id="progress-container" class="mt-4" style="display:none;">
-            <h4 id="phase">Preparing stream...</h4>
-            
+            <h4 id="phase">Preparing...</h4>
             <div class="mb-3">
-                <strong>Stream Progress</strong>
-                <div class="progress mb-2">
-                    <div id="stream-bar" class="progress-bar bg-primary progress-bar-striped progress-bar-animated" style="width:0%">0%</div>
+                <strong>Streaming Progress</strong>
+                <div class="progress mb-2" style="height:40px;">
+                    <div id="stream-bar" class="progress-bar progress-bar-striped progress-bar-animated bg-success" 
+                         style="width:0%; font-size:20px;">0%</div>
                 </div>
                 <small id="stream-details">0 MB / 0 MB • 0.00 MB/s</small>
             </div>
-
             <div class="row text-center mt-3">
-                <div class="col"><strong>Time Elapsed:</strong> <span id="elapsed">0s</span></div>
+                <div class="col"><strong>Elapsed:</strong> <span id="elapsed">0s</span></div>
                 <div class="col"><strong>ETA:</strong> <span id="eta">--</span></div>
-                <div class="col"><strong>Total Size:</strong> <span id="size">0 MB</span></div>
+                <div class="col"><strong>Size:</strong> <span id="size">Detecting...</span></div>
             </div>
         </div>
 
@@ -61,20 +98,15 @@ def get_home_html(show_form: bool = False):
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Seedr to YouTube Stream Uploader</title>
+        <title>Seedr → YouTube Stream Uploader</title>
         <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
         <script>
-            function formatBytes(bytes) {{
-                if (bytes === 0) return '0 MB';
-                const mb = bytes / (1024 * 1024);
-                return mb.toFixed(2) + ' MB';
-            }}
-            function formatTime(seconds) {{
-                if (seconds < 60) return seconds + 's';
-                if (seconds < 3600) return Math.floor(seconds / 60) + 'm ' + (seconds % 60) + 's';
-                const h = Math.floor(seconds / 3600);
-                const m = Math.floor((seconds % 3600) / 60);
-                return h + 'h ' + m + 'm';
+            function formatBytes(bytes) {{ return (bytes / (1024*1024)).toFixed(2) + ' MB'; }}
+            function formatTime(sec) {{
+                if (sec < 60) return Math.floor(sec) + 's';
+                if (sec < 3600) return Math.floor(sec/60) + 'm ' + Math.floor(sec%60) + 's';
+                const h = Math.floor(sec/3600);
+                return h + 'h ' + Math.floor((sec%3600)/60) + 'm';
             }}
             function startProgress() {{
                 document.getElementById('progress-container').style.display = 'block';
@@ -89,9 +121,8 @@ def get_home_html(show_form: bool = False):
                     document.getElementById('stream-bar').textContent = data.progress + '%';
                     document.getElementById('stream-details').textContent = 
                         formatBytes(data.transferred) + ' / ' + data.size + ' • ' + data.speed + ' MB/s';
-
                     const elapsed = (Date.now() - startTime) / 1000;
-                    document.getElementById('elapsed').textContent = formatTime(Math.floor(elapsed));
+                    document.getElementById('elapsed').textContent = formatTime(elapsed);
                     document.getElementById('eta').textContent = data.eta;
                     document.getElementById('size').textContent = data.size;
                 }};
@@ -99,15 +130,15 @@ def get_home_html(show_form: bool = False):
         </script>
     </head>
     <body class="bg-light">
-        <div class="container mt-5">
-            <h1 class="text-center mb-4">Seedr → YouTube Direct Stream</h1>
+        <div class="container mt-5 text-center">
+            <h1>Seedr → YouTube Direct Stream</h1>
             {login_btn if not show_form else form}
         </div>
     </body>
     </html>
     """
 
-# ------------------- Routes -------------------
+# ------------------- Routes & Progress -------------------
 @app.get("/", response_class=HTMLResponse)
 def home():
     return get_home_html(show_form="creds" in TOKEN)
@@ -130,7 +161,6 @@ def logout():
     TOKEN.clear()
     return RedirectResponse("/")
 
-# ------------------- Progress State -------------------
 progress_state = {
     "phase": "Idle",
     "transferred": 0,
@@ -143,24 +173,21 @@ async def progress_generator(request: Request):
     while True:
         if await request.is_disconnected():
             break
-
         total = progress_state["total_size"] or 1
         elapsed = time.time() - progress_state["start_time"]
         speed = progress_state["transferred"] / elapsed / (1024*1024) if elapsed > 0 else 0
         remaining = total - progress_state["transferred"]
         eta = remaining / (speed * 1024*1024) if speed > 0 else 999999
-
         data = {
             "phase": progress_state["phase"],
-            "progress": round(progress_state["transferred"] / total * 100, 1),
+            "progress": round(progress_state["transferred"] / total * 100, 1) if total else 0,
             "transferred": progress_state["transferred"],
             "speed": f"{speed:.2f}",
             "eta": format_time(eta) if eta < 999999 else "Calculating...",
-            "size": f"{total / (1024*1024):.2f} MB",
+            "size": f"{total / (1024*1024):.2f} MB" if total else "Detecting...",
         }
         yield f"data: {json.dumps(data)}\n\n"
         await asyncio.sleep(1)
-
         if progress_state["phase"] in ["Done", "Error"]:
             yield "data: DONE\n\n"
             break
@@ -176,72 +203,6 @@ def format_time(seconds):
 async def progress_stream(request: Request):
     return StreamingResponse(progress_generator(request), media_type="text/event-stream")
 
-# ------------------- Manual Resumable Upload Function -------------------
-def stream_upload_to_youtube(youtube, seedr_url, title):
-    # Step 1: Initiate resumable session
-    body = {
-        "snippet": {"title": title, "categoryId": "22"},
-        "status": {"privacyStatus": "private"}
-    }
-    init_request = youtube.videos().insert(part="snippet,status", body=body, media_body=None)
-    init_request.uri = init_request.uri.replace("upload/youtube/v3/videos?", "upload/youtube/v3/videos?uploadType=resumable&")
-    response = init_request.execute()
-    session_uri = response["headers"]["location"]
-
-    # Get total size from Seedr
-    head_resp = requests.head(seedr_url, timeout=30)
-    total_size = int(head_resp.headers.get("content-length", 0))
-    if total_size == 0:
-        raise Exception("Cannot determine file size from Seedr link.")
-    
-    progress_state["total_size"] = total_size
-    progress_state["phase"] = "Streaming from Seedr to YouTube..."
-
-    chunk_size = 5 * 1024 * 1024  # 5MB chunks
-    bytes_sent = 0
-
-    while bytes_sent < total_size:
-        start = bytes_sent
-        end = min(start + chunk_size - 1, total_size - 1)
-        range_header = f"bytes={start}-{end}"
-
-        # Fetch chunk from Seedr
-        seedr_resp = requests.get(seedr_url, headers={"Range": range_header}, stream=True, timeout=120)
-        seedr_resp.raise_for_status()
-        chunk_data = b""
-        for chunk in seedr_resp.iter_content(chunk_size=1024):
-            if chunk:
-                chunk_data += chunk
-
-        if len(chunk_data) == 0:
-            break
-
-        # Upload chunk to YouTube
-        content_range = f"bytes {start}-{start + len(chunk_data) - 1}/{total_size}"
-        upload_headers = {
-            "Content-Range": content_range,
-            "Content-Length": str(len(chunk_data))
-        }
-        upload_resp = requests.put(
-            session_uri,
-            data=chunk_data,
-            headers=upload_headers,
-            timeout=120
-        )
-        upload_resp.raise_for_status()
-
-        bytes_sent += len(chunk_data)
-        progress_state["transferred"] = bytes_sent
-
-    # Finalize upload
-    if bytes_sent == total_size:
-        final_resp = requests.put(session_uri, headers={"Content-Range": f"bytes */{total_size}"}, timeout=30)
-        final_resp.raise_for_status()
-        video_id = final_resp.json()["id"]
-        return f"https://www.youtube.com/watch?v={video_id}"
-    else:
-        raise Exception("Incomplete upload")
-
 # ------------------- Upload Route -------------------
 @app.post("/upload", response_class=HTMLResponse)
 async def upload(seedr_url: str = Form(...), title: str = Form(...)):
@@ -254,24 +215,52 @@ async def upload(seedr_url: str = Form(...), title: str = Form(...)):
             return HTMLResponse("<div class='alert alert-danger'>Missing refresh token. <a href='/logout'>Re-login</a></div>")
 
         creds = Credentials.from_authorized_user_info(creds_info, SCOPES)
-        # Refresh if needed
         if creds.expired and creds.refresh_token:
             creds.refresh(AuthRequest())
+
         youtube = build("youtube", "v3", credentials=creds)
 
         progress_state.update({
-            "phase": "Initializing stream session...",
+            "phase": "Initializing stream from Seedr...",
             "transferred": 0,
             "total_size": 0,
             "start_time": time.time(),
         })
 
-        video_url = stream_upload_to_youtube(youtube, seedr_url, title)
+        # Create streaming object
+        stream_obj = SeedrStream(seedr_url)
+        progress_state["total_size"] = stream_obj.size() or 1  # Fallback if no content-length
+
+        progress_state["phase"] = "Streaming to YouTube..."
+
+        media = MediaIoBaseUpload(
+            stream_obj,
+            mimetype="video/mp4",
+            chunksize=CHUNK_SIZE,
+            resumable=True
+        )
+
+        request = youtube.videos().insert(
+            part="snippet,status",
+            body={
+                "snippet": {"title": title, "categoryId": "22"},
+                "status": {"privacyStatus": "private"}
+            },
+            media_body=media
+        )
+
+        response = None
+        while response is None:
+            status, response = request.next_chunk()
+            if status:
+                progress_state["transferred"] = int(status.resumable_progress)
+
+        video_url = f"https://www.youtube.com/watch?v={response['id']}"
         progress_state["phase"] = "Done"
 
         return f"""
         <div class="alert alert-success text-center p-4">
-            <h3>✅ Stream Upload Complete!</h3>
+            <h3>✅ Streaming Upload Complete!</h3>
             <p><strong>Title:</strong> {title}</p>
             <a href="{video_url}" target="_blank" class="btn btn-primary btn-lg">Watch on YouTube</a>
             <hr>
@@ -283,8 +272,11 @@ async def upload(seedr_url: str = Form(...), title: str = Form(...)):
         progress_state["phase"] = "Error"
         return f"""
         <div class="alert alert-danger">
-            <h4>Stream Failed</h4>
+            <h4>Upload Failed</h4>
             <pre>{str(e)}</pre>
             <a href="/">← Go Back</a>
         </div>
         """
+    finally:
+        if 'stream_obj' in locals():
+            stream_obj.close()
