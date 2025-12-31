@@ -64,40 +64,49 @@ def oauth2callback(code: str):
 
 from fastapi.responses import RedirectResponse
 
-@app.post("/upload", response_class=HTMLResponse)
+@app.post("/upload")
 def upload(seedr_url: str = Form(...), title: str = Form("Private Video")):
 
+    # 🔐 HARD CHECK
     if "creds" not in TOKEN:
         return RedirectResponse("/login", status_code=302)
 
-    creds = Credentials(**TOKEN["creds"])
-    youtube = build("youtube", "v3", credentials=creds)
+    try:
+        creds = Credentials(**TOKEN["creds"])
+        youtube = build("youtube", "v3", credentials=creds)
 
-    r = requests.get(seedr_url, stream=True)
-    r.raise_for_status()
+        r = requests.get(seedr_url, stream=True, timeout=30)
+        r.raise_for_status()
 
-    stream = io.BytesIO()
-    for chunk in r.iter_content(chunk_size=1024 * 1024):
-        if chunk:
-            stream.write(chunk)
-    stream.seek(0)
+        stream = io.BytesIO()
+        for chunk in r.iter_content(chunk_size=1024 * 1024):
+            if chunk:
+                stream.write(chunk)
+        stream.seek(0)
 
-    media = MediaIoBaseUpload(stream, mimetype="video/mp4", resumable=True)
+        media = MediaIoBaseUpload(stream, mimetype="video/mp4", resumable=True)
 
-    request = youtube.videos().insert(
-        part="snippet,status",
-        body={
-            "snippet": {"title": title, "categoryId": "22"},
-            "status": {"privacyStatus": "private"}
-        },
-        media_body=media
-    )
+        request = youtube.videos().insert(
+            part="snippet,status",
+            body={
+                "snippet": {"title": title, "categoryId": "22"},
+                "status": {"privacyStatus": "private"}
+            },
+            media_body=media
+        )
 
-    response = request.execute()
-    link = f"https://www.youtube.com/watch?v={response['id']}"
+        response = request.execute()
+        link = f"https://www.youtube.com/watch?v={response['id']}"
 
-    return f"""
-    <h3>Upload Successful</h3>
-    <a href="{link}" target="_blank">{link}</a><br><br>
-    <a href="/">Upload another</a>
-    """
+        return HTMLResponse(f"""
+        <h3>Upload Successful</h3>
+        <a href="{link}" target="_blank">{link}</a><br><br>
+        <a href="/">Upload another</a>
+        """)
+
+    except Exception as e:
+        return HTMLResponse(
+            f"<h3>Error</h3><pre>{str(e)}</pre><a href='/'>Go back</a>",
+            status_code=500
+        )
+
