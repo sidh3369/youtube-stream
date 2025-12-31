@@ -10,7 +10,7 @@ from google.oauth2.credentials import Credentials
 app = FastAPI()
 
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
-REDIRECT_URI = "https://YOUR-RENDER-URL.onrender.com/oauth2callback"
+REDIRECT_URI = "https://ys-duda.onrender.com/oauth2callback"
 
 TOKEN = {}
 
