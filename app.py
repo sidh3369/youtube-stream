@@ -1,6 +1,7 @@
 import io
 import requests
-from fastapi import FastAPI, Form
+from fastapi import FastAPI, Request, Form
+from fastapi.responses import RedirectResponse, HTMLResponse
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
@@ -11,90 +12,47 @@ app = FastAPI()
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 REDIRECT_URI = "https://YOUR-RENDER-URL.onrender.com/oauth2callback"
 
-# TEMP storage (in-memory tokens)
-TOKEN_STORE = {}
+TOKEN = {}
 
-@app.get("/")
+@app.get("/", response_class=HTMLResponse)
 def home():
-    return {
-        "status": "ok",
-        "message": "POST /upload with seedr_url"
-    }
+    if "creds" not in TOKEN:
+        return """
+        <h2>YouTube Private Uploader</h2>
+        <a href="/login"><button>Login with Google (One Time)</button></a>
+        """
+    return """
+    <h2>Upload to YouTube (Private)</h2>
+    <form action="/upload" method="post">
+        <input type="text" name="seedr_url" placeholder="Paste Seedr Direct Link" size="80" required><br><br>
+        <input type="text" name="title" placeholder="Video Title"><br><br>
+        <button type="submit">Upload</button>
+    </form>
+    """
 
-@app.get("/auth")
-def auth():
+@app.get("/login")
+def login():
     flow = Flow.from_client_secrets_file(
         "client_secret.json",
         scopes=SCOPES,
         redirect_uri=REDIRECT_URI
     )
-    auth_url, state = flow.authorization_url(
+    auth_url, _ = flow.authorization_url(
         access_type="offline",
         include_granted_scopes="true"
     )
-    TOKEN_STORE["state"] = state
-    return {"auth_url": auth_url}
+    return RedirectResponse(auth_url)
 
 @app.get("/oauth2callback")
-def oauth2callback(code: str, state: str):
+def oauth2callback(code: str):
     flow = Flow.from_client_secrets_file(
         "client_secret.json",
         scopes=SCOPES,
-        redirect_uri=REDIRECT_URI,
-        state=state
+        redirect_uri=REDIRECT_URI
     )
     flow.fetch_token(code=code)
     creds = flow.credentials
-    TOKEN_STORE["creds"] = creds_to_dict(creds)
-    return {"status": "authorized"}
-
-@app.post("/upload")
-def upload(seedr_url: str = Form(...), title: str = Form("Private Video")):
-    if "creds" not in TOKEN_STORE:
-        return {"error": "Authorize first via /auth"}
-
-    creds = Credentials(**TOKEN_STORE["creds"])
-    youtube = build("youtube", "v3", credentials=creds)
-
-    # STREAM from Seedr
-    r = requests.get(seedr_url, stream=True, timeout=30)
-    r.raise_for_status()
-
-    stream = io.BytesIO()
-    for chunk in r.iter_content(chunk_size=1024 * 1024):
-        if chunk:
-            stream.write(chunk)
-
-    stream.seek(0)
-
-    media = MediaIoBaseUpload(
-        stream,
-        mimetype="video/mp4",
-        resumable=True
-    )
-
-    request = youtube.videos().insert(
-        part="snippet,status",
-        body={
-            "snippet": {
-                "title": title,
-                "description": "Cloud to cloud private upload",
-                "categoryId": "22"
-            },
-            "status": {
-                "privacyStatus": "private"
-            }
-        },
-        media_body=media
-    )
-
-    response = request.execute()
-    return {
-        "youtube_link": f"https://www.youtube.com/watch?v={response['id']}"
-    }
-
-def creds_to_dict(creds):
-    return {
+    TOKEN["creds"] = {
         "token": creds.token,
         "refresh_token": creds.refresh_token,
         "token_uri": creds.token_uri,
@@ -102,3 +60,39 @@ def creds_to_dict(creds):
         "client_secret": creds.client_secret,
         "scopes": creds.scopes,
     }
+    return RedirectResponse("/")
+
+@app.post("/upload", response_class=HTMLResponse)
+def upload(seedr_url: str = Form(...), title: str = Form("Private Video")):
+    creds = Credentials(**TOKEN["creds"])
+    youtube = build("youtube", "v3", credentials=creds)
+
+    r = requests.get(seedr_url, stream=True)
+    r.raise_for_status()
+
+    stream = io.BytesIO()
+    for chunk in r.iter_content(chunk_size=1024 * 1024):
+        if chunk:
+            stream.write(chunk)
+    stream.seek(0)
+
+    media = MediaIoBaseUpload(stream, mimetype="video/mp4", resumable=True)
+
+    request = youtube.videos().insert(
+        part="snippet,status",
+        body={
+            "snippet": {"title": title, "categoryId": "22"},
+            "status": {"privacyStatus": "private"}
+        },
+        media_body=media
+    )
+
+    response = request.execute()
+    link = f"https://www.youtube.com/watch?v={response['id']}"
+
+    return f"""
+    <h3>Upload Successful</h3>
+    <a href="{link}" target="_blank">{link}</a>
+    <br><br>
+    <a href="/">Upload another</a>
+    """
